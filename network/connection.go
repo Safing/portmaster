@@ -57,8 +57,7 @@ type Connection struct { //nolint:maligned // TODO: fix alignment
 	pktQueue        chan packet.Packet
 	firewallHandler FirewallHandler
 
-	activeInspectors []bool
-	inspectorData    map[uint8]interface{}
+	inspectors []Inspector
 
 	saveWhenFinished       bool
 	profileRevisionCounter uint64
@@ -188,6 +187,7 @@ func NewConnectionFromFirstPacket(pkt packet.Packet) *Connection {
 		Entity: entity,
 		// meta
 		Started:                time.Now().Unix(),
+		Inspecting:             true,
 		profileRevisionCounter: proc.Profile().RevisionCnt(),
 	}
 }
@@ -413,24 +413,14 @@ func (conn *Connection) packetHandler() {
 	}
 }
 
-// GetActiveInspectors returns the list of active inspectors.
-func (conn *Connection) GetActiveInspectors() []bool {
-	return conn.activeInspectors
+// GetInspectors returns the list of inspectors.
+func (conn *Connection) GetInspectors() []Inspector {
+	return conn.inspectors
 }
 
-// SetActiveInspectors sets the list of active inspectors.
-func (conn *Connection) SetActiveInspectors(new []bool) {
-	conn.activeInspectors = new
-}
-
-// GetInspectorData returns the list of inspector data.
-func (conn *Connection) GetInspectorData() map[uint8]interface{} {
-	return conn.inspectorData
-}
-
-// SetInspectorData set the list of inspector data.
-func (conn *Connection) SetInspectorData(new map[uint8]interface{}) {
-	conn.inspectorData = new
+// SetInspectors sets the list of inspectors.
+func (conn *Connection) SetInspectors(new []Inspector) {
+	conn.inspectors = new
 }
 
 // String returns a string representation of conn.

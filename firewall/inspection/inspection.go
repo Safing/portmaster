@@ -1,102 +1,115 @@
 package inspection
 
 import (
+	"errors"
+	"sort"
 	"sync"
 
+	"github.com/safing/portbase/log"
 	"github.com/safing/portmaster/network"
 	"github.com/safing/portmaster/network/packet"
 )
 
-//nolint:golint,stylecheck // FIXME
-const (
-	DO_NOTHING uint8 = iota
-	BLOCK_PACKET
-	DROP_PACKET
-	BLOCK_CONN
-	DROP_CONN
-	STOP_INSPECTING
-)
+// Registration holds information about and the factory of a registered inspector.
+type Registration struct {
+	// Name of the Inspector
+	Name string
 
-type inspectorFn func(*network.Connection, packet.Packet) uint8
+	// Order defines the priority in which the inspector should run. Decrease for higher priority, increase for lower priority. Leave at 0 for no preference.
+	Order int
+
+	// Factory creates a new inspector. It may also return a nil inspector, which means that no inspection is desired.
+	// Any processing on the packet should only occur on the first call of Inspect. After creating a new Inspector, Inspect is is called with the same connection and packet for actual processing.
+	Factory func(conn *network.Connection, pkt packet.Packet) (network.Inspector, error)
+}
+
+// Registry is a sortable []*Registration wrapper.
+type Registry []*Registration
+
+func (r Registry) Len() int           { return len(r) }
+func (r Registry) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
+func (r Registry) Less(i, j int) bool { return r[i].Order < r[j].Order }
 
 var (
-	inspectors      []inspectorFn
-	inspectorNames  []string
-	inspectVerdicts []network.Verdict
-	inspectorsLock  sync.Mutex
+	inspectorRegistry     []*Registration
+	inspectorRegistryLock sync.Mutex
 )
 
 // RegisterInspector registers a traffic inspector.
-func RegisterInspector(name string, inspector inspectorFn, inspectVerdict network.Verdict) (index int) {
-	inspectorsLock.Lock()
-	defer inspectorsLock.Unlock()
-	index = len(inspectors)
-	inspectors = append(inspectors, inspector)
-	inspectorNames = append(inspectorNames, name)
-	inspectVerdicts = append(inspectVerdicts, inspectVerdict)
-	return
+func RegisterInspector(new *Registration) error {
+	inspectorRegistryLock.Lock()
+	defer inspectorRegistryLock.Unlock()
+
+	if new.Factory == nil {
+		return errors.New("missing inspector factory")
+	}
+
+	// check if name exists
+	for _, r := range inspectorRegistry {
+		if new.Name == r.Name {
+			return errors.New("already registered")
+		}
+	}
+
+	// append to list
+	inspectorRegistry = append(inspectorRegistry, new)
+
+	// sort
+	sort.Stable(Registry(inspectorRegistry))
+
+	return nil
 }
 
-// RunInspectors runs all the applicable inspectors on the given packet.
-func RunInspectors(conn *network.Connection, pkt packet.Packet) (network.Verdict, bool) {
-	// inspectorsLock.Lock()
-	// defer inspectorsLock.Unlock()
+// InitializeInspectors initializes all applicable inspectors for the connection.
+func InitializeInspectors(conn *network.Connection, pkt packet.Packet) {
+	inspectorRegistryLock.Lock()
+	defer inspectorRegistryLock.Unlock()
 
-	activeInspectors := conn.GetActiveInspectors()
-	if activeInspectors == nil {
-		activeInspectors = make([]bool, len(inspectors))
-		conn.SetActiveInspectors(activeInspectors)
+	connInspectors := make([]network.Inspector, 0, len(inspectorRegistry))
+	for _, r := range inspectorRegistry {
+		inspector, err := r.Factory(conn, pkt)
+		switch {
+		case err != nil:
+			log.Tracer(pkt.Ctx()).Warningf("failed to initialize inspector %s: %v", r.Name, err)
+		case inspector != nil:
+			connInspectors = append(connInspectors, inspector)
+		}
 	}
 
-	inspectorData := conn.GetInspectorData()
-	if inspectorData == nil {
-		inspectorData = make(map[uint8]interface{})
-		conn.SetInspectorData(inspectorData)
-	}
+	conn.SetInspectors(connInspectors)
+}
 
-	continueInspection := false
-	verdict := network.VerdictUndecided
-
-	for key, skip := range activeInspectors {
-
-		if skip {
+// RunInspectors runs all the applicable inspectors on the given packet of the connection. It returns the first error received by an inspector.
+func RunInspectors(conn *network.Connection, pkt packet.Packet) (pktVerdict network.Verdict, continueInspection bool) {
+	connInspectors := conn.GetInspectors()
+	for i, inspector := range connInspectors {
+		// check if slot is active
+		if inspector == nil {
 			continue
 		}
 
-		// check if the current verdict is already past the inspection criteria.
-		if conn.Verdict > inspectVerdicts[key] {
-			activeInspectors[key] = true
-			continue
+		// run inspector
+		inspectorPktVerdict, proceed, err := inspector.Inspect(conn, pkt)
+		if err != nil {
+			log.Tracer(pkt.Ctx()).Warningf("inspector %s failed: %s", inspector.Name(), err)
+		}
+		// merge
+		if inspectorPktVerdict > pktVerdict {
+			pktVerdict = inspectorPktVerdict
+		}
+		if proceed {
+			continueInspection = true
 		}
 
-		action := inspectors[key](conn, pkt) // Actually run inspector
-		switch action {
-		case DO_NOTHING:
-			if verdict < network.VerdictAccept {
-				verdict = network.VerdictAccept
+		// destroy if finished or failed
+		if !proceed || err != nil {
+			err = inspector.Destroy()
+			if err != nil {
+				log.Tracer(pkt.Ctx()).Debugf("inspector %s failed to destroy: %s", inspector.Name(), err)
 			}
-			continueInspection = true
-		case BLOCK_PACKET:
-			if verdict < network.VerdictBlock {
-				verdict = network.VerdictBlock
-			}
-			continueInspection = true
-		case DROP_PACKET:
-			verdict = network.VerdictDrop
-			continueInspection = true
-		case BLOCK_CONN:
-			conn.SetVerdict(network.VerdictBlock, "", nil)
-			verdict = conn.Verdict
-			activeInspectors[key] = true
-		case DROP_CONN:
-			conn.SetVerdict(network.VerdictDrop, "", nil)
-			verdict = conn.Verdict
-			activeInspectors[key] = true
-		case STOP_INSPECTING:
-			activeInspectors[key] = true
+			connInspectors[i] = nil
 		}
-
 	}
 
-	return verdict, continueInspection
+	return pktVerdict, continueInspection
 }
